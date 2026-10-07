@@ -58,6 +58,7 @@ def batch_page(ctx):
         batch, service.list_nodes(ctx.conn, bid), service.list_artifacts(ctx.conn, bid),
         summary, events, gaps, risk_groups, service.list_versions(ctx.conn, bid),
         service.list_handovers(ctx.conn, bid),
+        service.list_calibrations(ctx.conn, bid),
         ctx.query.get("msg"), ctx.query.get("err")))
 
 
@@ -100,6 +101,36 @@ def submit_reading(ctx):
         f"读数已保存，生成评估版本 v{result['version']}"))
 
 
+@router.route("POST", "/batches/<bid>/calibrations")
+def calibrate_page(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    try:
+        result = service.calibrate_artifact(
+            ctx.conn, bid, ctx.body.get("artifact_id"), ctx.body.get("seen_version"),
+            ctx.body.get("temp_min"), ctx.body.get("temp_max"),
+            ctx.body.get("hum_min"), ctx.body.get("hum_max"),
+            ctx.body.get("sample_interval"), ctx.body.get("reason", ""))
+    except service.ConflictError as e:
+        return redirect(f"/batches/{bid}?err=" + quote(e.message))
+    except service.ValidationError as e:
+        msg = e.message + "：" + "；".join(e.details) if e.details else e.message
+        return redirect(f"/batches/{bid}?err=" + quote(msg))
+    except service.NotFoundError as e:
+        return redirect(f"/batches/{bid}?err=" + quote(e.message))
+    vno = result["version"]["version_no"]
+    return redirect(f"/batches/{bid}/versions/{vno}?msg=" + quote(
+        f"已按新标准校准并生成评估版本 v{vno}，新风险事件已重新开放"))
+
+
+@router.route("GET", "/batches/<bid>/calibrations/<vno>")
+def calibration_page(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    vno = _int(ctx.params["vno"], "版本号")
+    batch = service.get_batch(ctx.conn, bid)
+    result = service.get_calibration(ctx.conn, bid, vno)
+    return Response(pages.calibration_page(batch, result))
+
+
 @router.route("POST", "/events/<eid>/close")
 def close_event(ctx):
     eid = _int(ctx.params["eid"], "事件 id")
@@ -118,7 +149,8 @@ def version_page(ctx):
     vno = _int(ctx.params["vno"], "版本号")
     batch = service.get_batch(ctx.conn, bid)
     detail = service.version_detail(ctx.conn, bid, vno)
-    return Response(pages.version_page(batch, detail))
+    return Response(pages.version_page(batch, detail,
+                                       ctx.query.get("msg"), ctx.query.get("err")))
 
 
 @router.route("GET", "/batches/<bid>/diff")
@@ -248,6 +280,31 @@ def api_list_packages(ctx):
     return json_response(service.list_packages(ctx.conn, bid))
 
 
+@router.route("POST", "/api/batches/<bid>/calibrations")
+def api_calibrate(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    result = service.calibrate_artifact(
+        ctx.conn, bid, body.get("artifact_id"), body.get("seen_version"),
+        body.get("temp_min"), body.get("temp_max"),
+        body.get("hum_min"), body.get("hum_max"),
+        body.get("sample_interval"), body.get("reason", ""))
+    return json_response(result, 201)
+
+
+@router.route("GET", "/api/batches/<bid>/calibrations")
+def api_list_calibrations(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    return json_response(service.list_calibrations(ctx.conn, bid))
+
+
+@router.route("GET", "/api/batches/<bid>/calibrations/<vno>")
+def api_calibration_detail(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    vno = _int(ctx.params["vno"], "版本号")
+    return json_response(service.get_calibration(ctx.conn, bid, vno))
+
+
 @router.route("GET", "/api/batches/<bid>/summary")
 def api_summary(ctx):
     bid = _int(ctx.params["bid"], "批次 id")
@@ -285,6 +342,22 @@ def api_version_detail(ctx):
     bid = _int(ctx.params["bid"], "批次 id")
     vno = _int(ctx.params["vno"], "版本号")
     return json_response(service.version_detail(ctx.conn, bid, vno))
+
+
+@router.route("GET", "/api/batches/<bid>/standards")
+def api_version_standards(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    vno = ctx.query.get("version")
+    if vno is not None:
+        vno = _int(vno, "版本号")
+    return json_response(service.version_standards(ctx.conn, bid, vno))
+
+
+@router.route("GET", "/api/batches/<bid>/versions/<vno>/standards")
+def api_version_standards_legacy(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    vno = _int(ctx.params["vno"], "版本号")
+    return json_response(service.version_standards(ctx.conn, bid, vno))
 
 
 @router.route("GET", "/api/batches/<bid>/versions/<vno>/risk-groups")

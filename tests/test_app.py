@@ -1125,5 +1125,428 @@ class HandoverApiTest(unittest.TestCase):
         self.assertEqual(len(records), 2)
 
 
+class CalibrationApiTest(unittest.TestCase):
+    """监测标准校准：整套重评、事件重开、标准快照、冲突与拒绝、冻结兼容。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import app
+        cls.tmp = tempfile.TemporaryDirectory()
+        db_path = os.path.join(cls.tmp.name, "test-cal.db")
+        cls.server = app.make_server("127.0.0.1", 0, db_path)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    def req(self, method, path, payload=None, raw=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(payload).encode() if payload is not None else raw
+        request = urllib.request.Request(url, data=data, method=method)
+        if payload is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=15) as resp:
+                body = resp.read().decode()
+                ctype = resp.headers["Content-Type"]
+                return resp.status, (json.loads(body) if "json" in ctype else body)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            try:
+                return e.code, json.loads(body)
+            except json.JSONDecodeError:
+                return e.code, body
+
+    def _setup_batch(self, name="标准校准测试批次", interval=600):
+        st, batch = self.req("POST", "/api/batches", {"name": name})
+        self.assertEqual(st, 201)
+        bid = batch["id"]
+        for seq, nm in ((1, "库房"), (2, "运输车"), (3, "展厅")):
+            self.req("POST", f"/api/batches/{bid}/nodes",
+                     {"seq": seq, "name": nm})
+        _, det = self.req("GET", f"/api/batches/{bid}")
+        node_ids = [n["id"] for n in det["nodes"]]
+        return bid, node_ids
+
+    def _add_artifact(self, bid, name, interval=600, hi=24):
+        st, art = self.req("POST", f"/api/batches/{bid}/artifacts",
+                           {"name": name, "temp_min": 18, "temp_max": hi,
+                            "hum_min": 45, "hum_max": 60, "sample_interval": interval})
+        self.assertEqual(st, 201)
+        return art["id"]
+
+    @staticmethod
+    def _r(aid, node, ts, t=20, h=50):
+        return {"artifact_id": aid, "node_id": node, "ts": ts,
+                "temperature": t, "humidity": h}
+
+    def _calibrate(self, bid, aid, seen, **over):
+        payload = {"artifact_id": aid, "seen_version": seen,
+                   "temp_min": 18, "temp_max": 28, "hum_min": 45, "hum_max": 60,
+                   "sample_interval": 600, "reason": "温度上限录错，经计量复核应为 28℃"}
+        payload.update(over)
+        return self.req("POST", f"/api/batches/{bid}/calibrations", payload)
+
+    def test_calibration_reevaluates_and_reopens(self):
+        bid, (n1, n2, n3) = self._setup_batch()
+        a1 = self._add_artifact(bid, "青花瓷瓶")
+        a2 = self._add_artifact(bid, "绢画")
+
+        # v1：甲 26℃ 越上界 24（事件）；乙读数正常
+        st, r1 = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(a1, n1, "2026-10-01T08:00:00Z", 20),
+            self._r(a1, n2, "2026-10-01T08:10:00Z", 26),
+            self._r(a1, n3, "2026-10-01T08:30:00Z", 21),
+            self._r(a2, n1, "2026-10-01T08:00:00Z", 20),
+        ]})
+        self.assertEqual(st, 201)
+        self.assertEqual(r1["version"], 1)
+        old_ev = [e for e in r1["events"]
+                  if e["artifact_id"] == a1 and e["metric"] == "temperature"][0]
+
+        # 关闭旧事件（填写处置说明 + 证据编号）
+        st, _ = self.req("POST", f"/api/events/{old_ev['id']}/close",
+                         {"note": "已调整温控", "evidence_no": "EV-C-1"})
+        self.assertEqual(st, 200)
+
+        # 校准：温度上限 24 → 28，基于所见 v1 → 原子生成 v2
+        st, cal = self._calibrate(bid, a1, seen=1)
+        self.assertEqual(st, 201, cal)
+        self.assertEqual(cal["version"]["version_no"], 2)
+        self.assertEqual(cal["version"]["kind"], "calibration")
+        # 全部既有读数照搬、读数本身不变、不沿用更正链
+        self.assertEqual(len(cal["readings"]), 4)
+        self.assertTrue(all(r["corrected_from"] is None for r in cal["readings"]))
+        # 26℃ 在新标准 [18,28] 内：甲温度事件消失，新事件全部开放
+        self.assertFalse([e for e in cal["events"]
+                          if e["artifact_id"] == a1 and e["metric"] == "temperature"])
+        self.assertTrue(all(e["status"] == "open" for e in cal["events"]))
+        # 校准元信息
+        c = cal["calibration"]
+        self.assertEqual(c["seen_version_no"], 1)
+        self.assertEqual(c["version_no"], 2)
+        self.assertEqual(c["artifact_id"], a1)
+        self.assertEqual(c["artifact_name"], "青花瓷瓶")
+        self.assertEqual(c["old_standard"]["temp_max"], 24)
+        self.assertEqual(c["new_standard"]["temp_max"], 28)
+        self.assertTrue(c["reason"].startswith("温度上限录错"))
+        # 读数集合不变；事件差异显示旧事件消失
+        diff = cal["diff"]
+        self.assertEqual(len(diff["readings"]["added"]), 0)
+        self.assertEqual(len(diff["readings"]["removed"]), 0)
+        self.assertEqual(len(diff["readings"]["corrected"]), 0)
+        self.assertEqual(len(diff["events"]["removed"]), 1)
+
+        # 文物当前标准已更新；后续写入使用最新标准
+        _, det = self.req("GET", f"/api/batches/{bid}")
+        row = [a for a in det["artifacts"] if a["id"] == a1][0]
+        self.assertEqual(row["temp_max"], 28)
+        st, r3 = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(a1, n3, "2026-10-01T08:40:00Z", 27)]})  # 27 < 28，不越界
+        self.assertEqual(st, 201)
+        self.assertEqual(r3["version"], 3)
+        self.assertFalse([e for e in r3["events"] if e["artifact_id"] == a1])
+
+        # 旧版 v1 读数、旧标准、旧评估及关闭结论仍可查询
+        st, v1 = self.req("GET", f"/api/batches/{bid}/versions/1")
+        self.assertEqual(st, 200)
+        self.assertEqual(v1["version"]["kind"], "readings")
+        old = [e for e in v1["events"] if e["id"] == old_ev["id"]][0]
+        self.assertEqual(old["status"], "closed")
+        self.assertEqual(old["close_evidence"], "EV-C-1")
+        self.assertEqual([s for s in v1["standards"]
+                          if s["artifact_id"] == a1][0]["temp_max"], 24)
+        self.assertIsNone(v1["calibration"])
+
+        # 版本标准接口：新版为 28 且与当前一致；旧版 24 且标记与当前不同
+        st, stds = self.req("GET", f"/api/batches/{bid}/standards")
+        self.assertEqual(stds["version"], 3)
+        s1 = [s for s in stds["standards"] if s["artifact_id"] == a1][0]
+        self.assertEqual(s1["temp_max"], 28)
+        self.assertTrue(s1["is_current"])
+        st, stds1 = self.req("GET", f"/api/batches/{bid}/versions/1/standards")
+        s_old = [s for s in stds1["standards"] if s["artifact_id"] == a1][0]
+        self.assertEqual(s_old["temp_max"], 24)
+        self.assertFalse(s_old["is_current"])
+        # 未被校准的乙标准两版相同
+        s2 = [s for s in stds["standards"] if s["artifact_id"] == a2][0]
+        self.assertEqual(s2["temp_max"], 24)
+
+        # 校准记录列表与详情
+        st, lst = self.req("GET", f"/api/batches/{bid}/calibrations")
+        self.assertEqual(st, 200)
+        self.assertEqual([c["version_no"] for c in lst], [2])
+        self.assertEqual(lst[0]["artifact_name"], "青花瓷瓶")
+        st, detail = self.req("GET", f"/api/batches/{bid}/calibrations/2")
+        self.assertEqual(st, 200)
+        self.assertEqual(detail["calibration"]["reason"], c["reason"])
+        self.assertEqual(detail["version"]["version_no"], 2)
+        self.assertIn("diff", detail)
+        # 非校准版本查询 → 404
+        st, err = self.req("GET", f"/api/batches/{bid}/calibrations/1")
+        self.assertEqual(st, 404)
+
+    def test_sample_interval_changes_gaps_and_other_artifact_keeps_standard(self):
+        bid, (n1, n2, _n3) = self._setup_batch(interval=600)
+        a1 = self._add_artifact(bid, "甲", interval=600)
+        a2 = self._add_artifact(bid, "乙", interval=600)
+        # v1：甲两条间隔 600 秒（无缺测）；乙一条
+        st, r1 = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(a1, n1, "2026-10-01T08:00:00Z", 20),
+            self._r(a1, n2, "2026-10-01T08:10:00Z", 20),
+            self._r(a2, n1, "2026-10-01T08:00:00Z", 20),
+        ]})
+        self.assertEqual(st, 201)
+        self.assertEqual(r1["gaps"], [])
+
+        # 校准甲：采样间隔 600 → 300；甲出现缺测，乙不受影响
+        st, cal = self._calibrate(bid, a1, seen=1, sample_interval=300, temp_max=24)
+        self.assertEqual(st, 201, cal)
+        gaps_a1 = [g for g in cal["gaps"] if g["artifact_id"] == a1]
+        gaps_a2 = [g for g in cal["gaps"] if g["artifact_id"] == a2]
+        self.assertEqual(len(gaps_a1), 1)
+        self.assertEqual(gaps_a1[0]["expected_interval"], 300)
+        self.assertEqual(gaps_a1[0]["actual_interval"], 600)
+        self.assertEqual(gaps_a2, [])
+        # 版本标准快照：甲 300、乙仍 600
+        stds = {s["artifact_id"]: s for s in cal["standards"]}
+        self.assertEqual(stds[a1]["sample_interval"], 300)
+        self.assertEqual(stds[a2]["sample_interval"], 600)
+
+    def test_rejections_and_conflict(self):
+        bid, (n1, _n2, _n3) = self._setup_batch()
+        a1 = self._add_artifact(bid, "甲")
+
+        # 无评估版本 → 400，不产生版本
+        st, err = self._calibrate(bid, a1, seen=0)
+        self.assertEqual(st, 400)
+        self.assertIn("尚无评估版本", err["error"])
+
+        # 产生 v1
+        st, r1 = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(a1, n1, "2026-10-01T08:00:00Z", 20)]})
+        self.assertEqual(st, 201)
+
+        # 与当前标准完全相同 → 400 且不产生版本
+        st, err = self._calibrate(bid, a1, seen=1, temp_max=24)
+        self.assertEqual(st, 400)
+        self.assertIn("完全相同", err["error"])
+        # 标准非法：无序上下限 / 非数值 / 非正整数间隔
+        st, err = self._calibrate(bid, a1, seen=1, temp_min=30, temp_max=10)
+        self.assertEqual(st, 400)
+        self.assertTrue(any("无序" in d for d in err["details"]))
+        st, err = self._calibrate(bid, a1, seen=1, temp_max="偏高")
+        self.assertEqual(st, 400)
+        self.assertTrue(any("非空的数值" in d for d in err["details"]))
+        st, err = self._calibrate(bid, a1, seen=1, sample_interval=0)
+        self.assertEqual(st, 400)
+        self.assertTrue(any("正整数" in d for d in err["details"]))
+        # 缺校准原因
+        st, err = self._calibrate(bid, a1, seen=1, reason="")
+        self.assertEqual(st, 400)
+        self.assertIn("校准原因不能为空", err["error"])
+        # 所见版本非法 / 不存在
+        st, err = self._calibrate(bid, a1, seen="x")
+        self.assertEqual(st, 400)
+        self.assertIn("所见版本号无效", err["error"])
+        st, err = self._calibrate(bid, a1, seen=99)
+        self.assertEqual(st, 400)
+        self.assertIn("所见版本 99 不存在", err["error"])
+        # 文物不属于批次 / 非法 id
+        bid2, _ = self._setup_batch("另一批次")
+        st, err = self._calibrate(bid2, a1, seen=1)
+        self.assertEqual(st, 404)
+        st, err = self._calibrate(bid, "不是整数", seen=1)
+        self.assertEqual(st, 400)
+        # 以上拒绝均不产生版本
+        _, versions = self.req("GET", f"/api/batches/{bid}/versions")
+        self.assertEqual([v["version_no"] for v in versions], [1])
+
+        # 合法校准生成 v2
+        st, cal = self._calibrate(bid, a1, seen=1)
+        self.assertEqual(st, 201)
+        self.assertEqual(cal["version"]["version_no"], 2)
+
+        # 提交时所见版本已过期（仍传 1）→ 409 要求重取
+        st, err = self._calibrate(bid, a1, seen=1, temp_min=15)
+        self.assertEqual(st, 409)
+        self.assertIn("已过期", err["error"])
+        self.assertEqual(err["seen_version"], 1)
+        self.assertEqual(err["current_version"], 2)
+        # 过期拒绝不产生版本
+        _, versions = self.req("GET", f"/api/batches/{bid}/versions")
+        self.assertEqual([v["version_no"] for v in versions], [2, 1])
+        # 以当前 v2 为所见版本再次校准成功
+        st, cal3 = self._calibrate(bid, a1, seen=2, temp_min=15)
+        self.assertEqual(st, 201)
+        self.assertEqual(cal3["version"]["version_no"], 3)
+        self.assertEqual(
+            cal3["calibration"]["old_standard"]["temp_min"], 18)
+
+    def test_risk_groups_recomputed_after_calibration(self):
+        bid, (n1, n2, n3) = self._setup_batch()
+        a1 = self._add_artifact(bid, "甲")
+        a2 = self._add_artifact(bid, "乙")
+        # v1：两文物在运输车同期温度越界 26（>24）→ 共因组
+        st, r1 = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(a1, n1, "2026-10-01T08:00:00Z", 20),
+            self._r(a1, n2, "2026-10-01T08:10:00Z", 26),
+            self._r(a1, n3, "2026-10-01T08:30:00Z", 21),
+            self._r(a2, n1, "2026-10-01T08:00:00Z", 20),
+            self._r(a2, n2, "2026-10-01T08:10:00Z", 26),
+            self._r(a2, n3, "2026-10-01T08:30:00Z", 21),
+        ]})
+        self.assertEqual(st, 201)
+        st, rg = self.req("GET", f"/api/batches/{bid}/risk-groups")
+        self.assertEqual(len(rg["groups"]), 1)
+        # 校准甲放宽上限 → 甲事件消失，共因组随之更新为无；旧版分组仍可查
+        st, cal = self._calibrate(bid, a1, seen=1)
+        self.assertEqual(st, 201)
+        st, rg2 = self.req("GET", f"/api/batches/{bid}/risk-groups")
+        self.assertEqual(rg2["version"], 2)
+        self.assertEqual(rg2["groups"], [])
+        st, rg1 = self.req("GET", f"/api/batches/{bid}/risk-groups?version=1")
+        self.assertEqual(len(rg1["groups"]), 1)
+        # 新版本快照内嵌分组也为空
+        st, v2 = self.req("GET", f"/api/batches/{bid}/versions/2")
+        self.assertEqual(v2["risk_groups"], [])
+
+    def test_handover_preview_new_standard_old_record_frozen(self):
+        bid, (n1, n2, _n3) = self._setup_batch("校准交接批次")
+        a1 = self._add_artifact(bid, "甲")
+        a2 = self._add_artifact(bid, "乙")
+        st, _ = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(a1, n1, "2026-10-01T08:00:00Z", 20),
+            self._r(a1, n2, "2026-10-01T08:10:00Z", 26),  # 越界
+            self._r(a2, n1, "2026-10-01T08:00:00Z", 20),
+            self._r(a2, n2, "2026-10-01T08:10:00Z", 26),  # 越界
+        ]})
+        self.assertEqual(st, 201)
+        # v1 预览：两件均命中未关闭事件 → 待核；确认后冻结
+        st, pv = self.req("POST", f"/api/batches/{bid}/handovers/preview",
+                          {"prev_node_id": n1, "next_node_id": n2,
+                           "handover_ts": "2026-10-01T08:10:00Z"})
+        self.assertEqual(st, 200)
+        self.assertEqual(pv["version"], 1)
+        self.assertEqual(pv["result"], "review")
+        st, rec = self.req("POST", f"/api/batches/{bid}/handovers", {
+            "prev_node_id": n1, "next_node_id": n2,
+            "handover_ts": "2026-10-01T08:10:00Z",
+            "version": 1, "preview_token": pv["preview_token"],
+            "note": "现场复核", "evidence_no": "HO-C-1"})
+        self.assertEqual(st, 201)
+        self.assertEqual(rec["version"], 1)
+
+        # 校准甲：上限放宽 → 甲不再越界
+        st, _ = self._calibrate(bid, a1, seen=1)
+        self.assertEqual(st, 201)
+        # 当前版（v2）交接预览按新标准核验：仅乙命中事件
+        st, pv2 = self.req("POST", f"/api/batches/{bid}/handovers/preview",
+                           {"prev_node_id": n1, "next_node_id": n2,
+                            "handover_ts": "2026-10-01T08:10:00Z"})
+        self.assertEqual(pv2["version"], 2)
+        hit = {i["artifact_id"] for i in pv2["items"] for e in i["events"]}
+        self.assertEqual(hit, {a2})
+        # 旧交接确认记录保持冻结：仍含两件命中，版本号仍为 1
+        st, frozen = self.req("GET", f"/api/batches/{bid}/handovers/{rec['id']}")
+        self.assertEqual(st, 200)
+        self.assertEqual(frozen["version"], 1)
+        frozen_hit = {i["artifact_id"] for i in frozen["items"] for e in i["events"]}
+        self.assertEqual(frozen_hit, {a1, a2})
+
+    def test_package_format_compatible_after_calibration(self):
+        bid, (n1, n2, _n3) = self._setup_batch()
+        a1 = self._add_artifact(bid, "甲")
+        st, r1 = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(a1, n1, "2026-10-01T08:00:00Z", 20)]})
+        self.assertEqual(st, 201)
+        # 校准放宽上限到 28
+        st, _ = self._calibrate(bid, a1, seen=1)
+        self.assertEqual(st, 201)
+        # 离线包格式不变；基准为当前 v2，合并按最新标准评估：27 不越界
+        st, pk = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-C-1", "base_version": 2, "note": "校准后回补",
+            "readings": [self._r(a1, n2, "2026-10-01T08:10:00Z", 27)]})
+        self.assertEqual(st, 201)
+        self.assertEqual(pk["version"], 3)
+        self.assertFalse([e for e in pk["events"]
+                          if e["artifact_id"] == a1 and e["metric"] == "temperature"])
+        # 同编号幂等仍生效
+        st, pk2 = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-C-1", "base_version": 2, "note": "校准后回补",
+            "readings": [self._r(a1, n2, "2026-10-01T08:10:00Z", 27)]})
+        self.assertEqual(st, 200)
+        self.assertTrue(pk2["deduplicated"])
+        # 读数键冲突规则仍按（文物, 时间戳）比对，与标准无关：
+        # 基准 v1 与当前 v3 的 08:00 读数（20℃）相同 → 不冲突，可合并新键
+        st, pk3 = self.req("POST", f"/api/batches/{bid}/packages", {
+            "package_id": "PKG-C-2", "base_version": 1, "note": "老基准",
+            "readings": [self._r(a1, n2, "2026-10-01T08:20:00Z", 27)]})
+        self.assertEqual(st, 201, pk3)
+        self.assertEqual(pk3["version"], 4)
+
+    def test_concurrent_calibration_serialized(self):
+        bid, (n1, _n2, _n3) = self._setup_batch()
+        a1 = self._add_artifact(bid, "甲")
+        self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(a1, n1, "2026-10-01T08:00:00Z", 20)]})
+        payload = {"artifact_id": a1, "seen_version": 1,
+                   "temp_min": 18, "temp_max": 28, "hum_min": 45, "hum_max": 60,
+                   "sample_interval": 600, "reason": "并发复核"}
+        results = []
+
+        def worker():
+            results.append(self.req(
+                "POST", f"/api/batches/{bid}/calibrations", payload))
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        statuses = sorted(s for s, _ in results)
+        self.assertEqual(statuses, [201] + [409] * 5)
+        _, versions = self.req("GET", f"/api/batches/{bid}/versions")
+        self.assertEqual(len(versions), 2)
+
+    def test_calibration_pages(self):
+        bid, (n1, n2, _n3) = self._setup_batch()
+        a1 = self._add_artifact(bid, "甲")
+        self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(a1, n1, "2026-10-01T08:00:00Z", 20),
+            self._r(a1, n2, "2026-10-01T08:10:00Z", 26)]})
+        st, _ = self._calibrate(bid, a1, seen=1)
+        self.assertEqual(st, 201)
+        # 批次页含校准入口与记录
+        st, html = self.req("GET", f"/batches/{bid}")
+        self.assertEqual(st, 200)
+        self.assertIn("监测标准校准", html)
+        self.assertIn("标准校准记录", html)
+        self.assertIn("标准校准", html)
+        # 版本快照页：版本类型 + 标准快照
+        st, html = self.req("GET", f"/batches/{bid}/versions/2")
+        self.assertEqual(st, 200)
+        self.assertIn("标准校准版本", html)
+        self.assertIn("监测标准快照", html)
+        # 校准结果页
+        st, html = self.req("GET", f"/batches/{bid}/calibrations/2")
+        self.assertEqual(st, 200)
+        self.assertIn("标准校准结果", html)
+        self.assertIn("温度上限录错", html)
+        # 页面表单提交（urlencoded）：303 跳转到新版本快照页（urllib 自动跟随）
+        form = ("artifact_id=" + str(a1)
+                + "&seen_version=2&temp_min=15&temp_max=28"
+                  "&hum_min=45&hum_max=60&sample_interval=600"
+                  "&reason=%E9%A1%B5%E9%9D%A2%E5%A4%8D%E6%A0%B8")
+        st, body = self.req("POST", f"/batches/{bid}/calibrations", raw=form.encode())
+        self.assertEqual(st, 200)
+        self.assertIn("评估版本 v3", body)
+
+
 if __name__ == "__main__":
     unittest.main()

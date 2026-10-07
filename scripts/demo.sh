@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 端到端演示：创建批次 → 节点 → 文物 → 读数（跨节点越界 + 缺测）→ 关闭事件 →
-# 更正读数生成新版本 → 查看版本差异 → 查询跨文物共因风险组。
+# 更正读数生成新版本 → 查看版本差异 → 查询跨文物共因风险组 → 离线采集包 →
+# 运输节点交接（预览/确认/冻结）→ 监测标准校准（整套重评、标准快照、过期冲突）。
 # 用法：BASE=http://localhost:8000 ./scripts/demo.sh
 set -euo pipefail
 BASE="${BASE:-http://localhost:8000}"
@@ -150,3 +151,31 @@ echo
 echo "== 20. 交接记录列表与详情（确认后冻结，补录/更正/关闭事件均不改写）=="
 curl -s "$BASE/api/batches/1/handovers"
 curl -s "$BASE/api/batches/1/handovers/1" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("记录 #%d 冻结于 v%d: %s｜说明: %s｜证据: %s" % (d["id"], d["version"], d["result_label"], d["note"], d["evidence_no"]))'
+
+echo
+echo "== 21. 监测标准校准：文物 1 温度上限 24→22（以当前版为所见版本整套重评，生成新版本；新事件重新开放）=="
+CUR_VER=$(curl -s "$BASE/api/batches/1/versions" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["version_no"])')
+curl -s -X POST "$BASE/api/batches/1/calibrations" -H "$JSON" -d "{
+  \"artifact_id\": 1,
+  \"seen_version\": $CUR_VER,
+  \"temp_min\": 18, \"temp_max\": 22, \"hum_min\": 45, \"hum_max\": 60,
+  \"sample_interval\": 600,
+  \"reason\": \"登记时温度上限录错，经计量室复核应为 22℃\"
+}" | python3 -c 'import json,sys; d=json.load(sys.stdin); c=d["calibration"]; print("校准成功: v%d → v%d（%s），温度上限 %g→%g；新版事件 %d 个（全部开放），缺测 %d 个，风险组 %d 组，读数仍为 %d 条" % (c["seen_version_no"], c["version_no"], c["artifact_name"], c["old_temp_max"], c["new_temp_max"], len(d["events"]), len(d["gaps"]), len(d["risk_groups"]), len(d["readings"])))'
+
+echo
+echo "== 22. 所见版本过期仍提交 → 409 要求重取；与当前标准相同 → 400 不产生版本 =="
+curl -s -X POST "$BASE/api/batches/1/calibrations" -H "$JSON" -d "{
+  \"artifact_id\": 1, \"seen_version\": $CUR_VER,
+  \"temp_min\": 18, \"temp_max\": 20, \"hum_min\": 45, \"hum_max\": 60,
+  \"sample_interval\": 600, \"reason\": \"用过期所见版本再次校准\"}"
+echo
+curl -s -X POST "$BASE/api/batches/1/calibrations" -H "$JSON" -d "{
+  \"artifact_id\": 1, \"seen_version\": $((CUR_VER + 1)),
+  \"temp_min\": 18, \"temp_max\": 22, \"hum_min\": 45, \"hum_max\": 60,
+  \"sample_interval\": 600, \"reason\": \"与当前标准相同\"}"
+
+echo
+echo "== 23. 版本标准与校准记录查询（旧版旧标准可查，旧交接记录保持冻结）=="
+curl -s "$BASE/api/batches/1/standards?version=$CUR_VER" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("v%d 标准快照:" % d["version"], [(s["artifact_name"], s["temp_max"], s["is_current"]) for s in d["standards"]])'
+curl -s "$BASE/api/batches/1/calibrations" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("校准记录:", [(c["seen_version_no"], c["version_no"], c["artifact_name"]) for c in d])'

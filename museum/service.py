@@ -1,5 +1,6 @@
 """业务逻辑层：批次/节点/文物管理、读数提交与版本化评估、事件关闭、版本差异、
-离线采集包合并（基准版本冲突检查 + 同编号幂等）、运输节点交接（预览 + 冻结确认）。"""
+离线采集包合并（基准版本冲突检查 + 同编号幂等）、运输节点交接（预览 + 冻结确认）、
+监测标准校准（整套新标准重评当前全部读数，原子生成校准版本）。"""
 from __future__ import annotations
 
 import hashlib
@@ -88,6 +89,51 @@ def to_int(value):
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return int(str(value).strip())  # 可能抛 ValueError
+
+
+# ---------------------------------------------------------------- 监测标准
+
+STANDARD_FIELDS = ("temp_min", "temp_max", "hum_min", "hum_max", "sample_interval")
+
+
+def _parse_standard(temp_min, temp_max, hum_min, hum_max, sample_interval,
+                    error_cls=ValidationError):
+    """解析并校验一整套监测标准（温湿度上下限 + 正整数采样间隔）。
+
+    登记文物与标准校准共用同一口径；任一字段非法或上下限无序时抛 error_cls，
+    details 为逐条中文原因。
+    """
+    errors = []
+    values = {}
+    for label, key, raw in (
+        ("温度下限", "temp_min", temp_min), ("温度上限", "temp_max", temp_max),
+        ("湿度下限", "hum_min", hum_min), ("湿度上限", "hum_max", hum_max),
+    ):
+        try:
+            values[key] = to_float(raw)
+        except (ValueError, TypeError):
+            errors.append(f"{label}必须为非空的数值，收到: {raw!r}")
+    try:
+        values["sample_interval"] = to_int(sample_interval)
+        if values["sample_interval"] <= 0:
+            errors.append("采样间隔必须为正整数（秒）")
+    except (ValueError, TypeError):
+        errors.append(f"采样间隔必须为正整数（秒），收到: {sample_interval!r}")
+    if "temp_min" in values and "temp_max" in values \
+            and values["temp_min"] > values["temp_max"]:
+        errors.append(
+            f"温度上下限无序：下限 {values['temp_min']:g} 大于上限 {values['temp_max']:g}")
+    if "hum_min" in values and "hum_max" in values \
+            and values["hum_min"] > values["hum_max"]:
+        errors.append(
+            f"湿度上下限无序：下限 {values['hum_min']:g} 大于上限 {values['hum_max']:g}")
+    if errors:
+        raise error_cls("监测标准校验失败", errors)
+    return values
+
+
+def _standard_tuple(standard):
+    return tuple(standard[k] for k in STANDARD_FIELDS)
 
 
 # ---------------------------------------------------------------- 查询
@@ -233,6 +279,35 @@ def list_batches(conn):
     return [batch_summary(conn, r["id"]) for r in rows]
 
 
+def version_standards(conn, batch_id, version_no=None):
+    """某评估版本所依据的各文物监测标准快照。
+
+    version_no 为空时取当前版本；批次无任何版本返回 version=None、standards=[]。
+    is_current 表示该文物当前标准是否与版本快照一致（不一致说明事后又校准过）。
+    """
+    get_batch(conn, batch_id)
+    if version_no is None:
+        v = current_version(conn, batch_id)
+        if not v:
+            return {"batch_id": batch_id, "version": None, "standards": []}
+    else:
+        v = get_version(conn, batch_id, version_no)
+    artifacts = {a["id"]: a for a in list_artifacts(conn, batch_id)}
+    standards_map = _version_standards_map(conn, v["id"], artifacts)
+    standards = []
+    for aid in sorted(standards_map):
+        s = dict(standards_map[aid])
+        a = artifacts.get(aid)
+        s["artifact_id"] = aid
+        s["artifact_name"] = a["name"] if a else str(aid)
+        if a:
+            s["is_current"] = all(a[k] == s[k] for k in STANDARD_FIELDS)
+        else:
+            s["is_current"] = None
+        standards.append(s)
+    return {"batch_id": batch_id, "version": v["version_no"], "standards": standards}
+
+
 def version_detail(conn, batch_id, version_no):
     v = get_version(conn, batch_id, version_no)
     names = _artifact_names(conn, batch_id)
@@ -243,6 +318,8 @@ def version_detail(conn, batch_id, version_no):
         "events": events,
         "gaps": version_gaps(conn, v["id"], names),
         "risk_groups": find_risk_groups(events),
+        "standards": version_standards(conn, batch_id, version_no)["standards"],
+        "calibration": calibration_for_version(conn, batch_id, version_no),
     }
 
 
@@ -336,31 +413,8 @@ def add_artifact(conn, batch_id, name, temp_min, temp_max, hum_min, hum_max,
     name = (name or "").strip()
     if not name:
         raise ValidationError("文物名称不能为空")
-    errors = []
-    values = {}
-    for label, key, raw in (
-        ("温度下限", "temp_min", temp_min), ("温度上限", "temp_max", temp_max),
-        ("湿度下限", "hum_min", hum_min), ("湿度上限", "hum_max", hum_max),
-    ):
-        try:
-            values[key] = to_float(raw)
-        except (ValueError, TypeError):
-            errors.append(f"{label}必须为非空的数值，收到: {raw!r}")
-    try:
-        values["sample_interval"] = to_int(sample_interval)
-        if values["sample_interval"] <= 0:
-            errors.append("采样间隔必须为正整数（秒）")
-    except (ValueError, TypeError):
-        errors.append(f"采样间隔必须为正整数（秒），收到: {sample_interval!r}")
-    if not errors:
-        if values["temp_min"] > values["temp_max"]:
-            errors.append(
-                f"温度上下限无序：下限 {values['temp_min']:g} 大于上限 {values['temp_max']:g}")
-        if values["hum_min"] > values["hum_max"]:
-            errors.append(
-                f"湿度上下限无序：下限 {values['hum_min']:g} 大于上限 {values['hum_max']:g}")
-    if errors:
-        raise ValidationError("文物参数校验失败", errors)
+    values = _parse_standard(temp_min, temp_max, hum_min, hum_max, sample_interval,
+                             ValidationError)
     with conn:
         cur = conn.execute(
             """INSERT INTO artifacts(batch_id, name, temp_min, temp_max, hum_min, hum_max,
@@ -428,11 +482,42 @@ def _validate_reading_items(conn, batch_id, items):
     return parsed
 
 
+def _snapshot_standards(conn, version_id, standards):
+    """把各文物在本版本使用的监测标准写入 version_standards 快照。
+
+    standards: {artifact_id: 含温湿度上下限与 sample_interval 的映射}。
+    """
+    for artifact_id, s in standards.items():
+        conn.execute(
+            """INSERT INTO version_standards(version_id, artifact_id, temp_min, temp_max,
+               hum_min, hum_max, sample_interval) VALUES (?,?,?,?,?,?,?)""",
+            (version_id, artifact_id, s["temp_min"], s["temp_max"],
+             s["hum_min"], s["hum_max"], s["sample_interval"]),
+        )
+
+
+def _version_standards_map(conn, version_id, fallback_artifacts=None):
+    """读取某版本的标准快照 {artifact_id: dict}。
+
+    旧库中早于标准版本化产生的版本可能没有快照，此时回退到 fallback_artifacts
+    （通常是文物当前标准），保证历史版本仍可正常查看与评估。
+    """
+    rows = conn.execute(
+        "SELECT * FROM version_standards WHERE version_id=?", (version_id,),
+    ).fetchall()
+    standards = {r["artifact_id"]: dict(r) for r in rows}
+    if not standards and fallback_artifacts:
+        for a in fallback_artifacts.values():
+            standards[a["id"]] = {k: a[k] for k in ("id", *STANDARD_FIELDS)}
+    return standards
+
+
 def _apply_readings(conn, batch_id, parsed, note=""):
     """把解析后的读数合并到当前版本，生成新评估版本并完成评估。
 
     与当前版本已有（文物, 时间戳）完全相同的读数视为重复时间戳，拒绝；
     数值不同的视为更正，以新值覆盖（旧版本快照保持不变）。
+    新版本照录各文物当前监测标准。
     调用方负责事务边界；返回 (version_no, prev_no, accepted, corrected)。
     """
     artifacts = {a["id"]: a for a in list_artifacts(conn, batch_id)}
@@ -462,7 +547,8 @@ def _apply_readings(conn, batch_id, parsed, note=""):
 
     version_no = (prev["version_no"] if prev else 0) + 1
     cur = conn.execute(
-        "INSERT INTO versions(batch_id, version_no, note, created_at) VALUES (?,?,?,?)",
+        """INSERT INTO versions(batch_id, version_no, kind, note, created_at)
+           VALUES (?,?, 'readings', ?,?)""",
         (batch_id, version_no, (note or "").strip(), now_iso()),
     )
     version_id = cur.lastrowid
@@ -484,6 +570,7 @@ def _apply_readings(conn, batch_id, parsed, note=""):
             (version_id, p["artifact_id"], p["node_id"], p["ts"],
              p["temperature"], p["humidity"], corrections.get(key)),
         )
+    _snapshot_standards(conn, version_id, artifacts)
     _evaluate_version(conn, version_id, artifacts)
     return version_no, (prev["version_no"] if prev else None), len(parsed), len(corrections)
 
@@ -658,6 +745,204 @@ def list_packages(conn, batch_id):
         (batch_id,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------- 监测标准校准
+
+def _get_batch_artifact(conn, batch_id, artifact_id):
+    try:
+        artifact_id = to_int(artifact_id)
+    except (ValueError, TypeError):
+        raise ValidationError(f"文物 id 必须为整数，收到: {artifact_id!r}")
+    row = conn.execute(
+        "SELECT * FROM artifacts WHERE id=? AND batch_id=?",
+        (artifact_id, batch_id),
+    ).fetchone()
+    if not row:
+        raise NotFoundError(f"文物 {artifact_id} 不属于批次 {batch_id} 或不存在")
+    return artifact_id, dict(row)
+
+
+def calibrate_artifact(conn, batch_id, artifact_id, seen_version,
+                       temp_min, temp_max, hum_min, hum_max, sample_interval,
+                       reason):
+    """监测标准校准：以整套新标准重评所见版本的全部既有读数，原子生成新版本。
+
+    - 必须存在评估版本（否则 400）；seen_version 为提交时所见版本号，非法 400、
+      不存在 400；提交时所见版本已过期（非当前版本）→ 409，要求重新获取；
+    - 新标准必须合法（数值、正整数采样间隔、上下限有序），且与当前标准不同，
+      否则 400 且不产生版本；校准原因必填；
+    - 新版本复制所见版本的全部读数（读数本身不变，corrected_from 置空）与各文物
+      标准快照（被校准文物用新标准），并按新快照整体重评：新事件一律开放，
+      缺测区间、共因风险组随之重算；
+    - 校准后该文物当前标准更新为新标准（后续读数提交/采集包合并沿用），
+      旧版读数、标准、评估与关闭结论仍可查询；旧交接确认记录保持冻结。
+    """
+    get_batch(conn, batch_id)
+    artifact_id, artifact = _get_batch_artifact(conn, batch_id, artifact_id)
+    try:
+        seen_no = to_int(seen_version)
+        if seen_no < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ValidationError(
+            f"所见版本号无效: {seen_version!r}（须为提交时所见的评估版本号）")
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValidationError("校准原因不能为空")
+    new_standard = _parse_standard(temp_min, temp_max, hum_min, hum_max,
+                                   sample_interval)
+    current = current_version(conn, batch_id)
+    if not current:
+        raise ValidationError(f"批次 {batch_id} 尚无评估版本，无法校准标准")
+    if _standard_tuple(new_standard) == _standard_tuple(artifact):
+        raise ValidationError(
+            "新标准与该文物当前监测标准完全相同，无需校准，未生成新版本")
+    seen = conn.execute(
+        "SELECT * FROM versions WHERE batch_id=? AND version_no=?",
+        (batch_id, seen_no),
+    ).fetchone()
+    if not seen:
+        raise ValidationError(
+            f"所见版本 {seen_no} 不存在：批次 {batch_id} 当前为 v{current['version_no']}")
+    if seen["id"] != current["id"]:
+        raise ConflictError(
+            f"提交时所见版本已过期：所见 v{seen_no}，当前为 "
+            f"v{current['version_no']}，请重新获取当前版本与标准后再校准",
+            {"seen_version": seen_no, "current_version": current["version_no"]})
+
+    note = f"标准校准：{artifact['name']}（{reason}）"
+    conn.execute("BEGIN IMMEDIATE")  # 串行化并发校准，事务内复查所见版本
+    try:
+        current2 = current_version(conn, batch_id)
+        if current2 is None or current2["id"] != seen["id"]:
+            cur_no = current2["version_no"] if current2 else 0
+            raise ConflictError(
+                f"提交时所见版本已过期：所见 v{seen_no}，当前为 v{cur_no}，"
+                "请重新获取当前版本与标准后再校准",
+                {"seen_version": seen_no, "current_version": cur_no})
+        # 事务内复查当前标准，避免与并发校准写入相同标准
+        fresh = conn.execute(
+            "SELECT * FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
+        if _standard_tuple(new_standard) == _standard_tuple(dict(fresh)):
+            raise ValidationError(
+                "新标准与该文物当前监测标准完全相同，无需校准，未生成版本")
+
+        standards = _version_standards_map(conn, seen["id"],
+                                           {a["id"]: a for a in list_artifacts(conn, batch_id)})
+        old_standard = dict(standards[artifact_id])
+        standards[artifact_id] = {"id": artifact_id, **new_standard}
+
+        new_no = current2["version_no"] + 1
+        cur = conn.execute(
+            """INSERT INTO versions(batch_id, version_no, kind, note, created_at)
+               VALUES (?,?, 'calibration', ?,?)""",
+            (batch_id, new_no, note, now_iso()))
+        new_version_id = cur.lastrowid
+
+        # 读数整套照搬：校准只改标准，不改任何既有读数（快照标记不沿用更正链）
+        conn.execute(
+            """INSERT INTO readings(version_id, artifact_id, node_id, ts,
+               temperature, humidity, corrected_from)
+               SELECT ?, artifact_id, node_id, ts, temperature, humidity, NULL
+               FROM readings WHERE version_id=?""",
+            (new_version_id, seen["id"]))
+        _snapshot_standards(conn, new_version_id, standards)
+        _evaluate_version(conn, new_version_id, standards)
+
+        conn.execute(
+            """UPDATE artifacts SET temp_min=?, temp_max=?, hum_min=?, hum_max=?,
+               sample_interval=? WHERE id=?""",
+            (new_standard["temp_min"], new_standard["temp_max"],
+             new_standard["hum_min"], new_standard["hum_max"],
+             new_standard["sample_interval"], artifact_id))
+        conn.execute(
+            """INSERT INTO calibrations(batch_id, artifact_id, seen_version_no, version_no,
+               old_temp_min, old_temp_max, old_hum_min, old_hum_max, old_sample_interval,
+               new_temp_min, new_temp_max, new_hum_min, new_hum_max, new_sample_interval,
+               reason, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (batch_id, artifact_id, seen_no, new_no,
+             old_standard["temp_min"], old_standard["temp_max"],
+             old_standard["hum_min"], old_standard["hum_max"],
+             old_standard["sample_interval"],
+             new_standard["temp_min"], new_standard["temp_max"],
+             new_standard["hum_min"], new_standard["hum_max"],
+             new_standard["sample_interval"], reason, now_iso()))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    result = version_detail(conn, batch_id, new_no)
+    result["calibration"] = get_calibration(conn, batch_id, new_no,
+                                            calibration_version=True)
+    result["diff"] = version_diff(conn, batch_id, seen_no, new_no)
+    return result
+
+
+def _standard_change(old, new):
+    return {
+        "before": {k: old[k] for k in STANDARD_FIELDS},
+        "after": {k: new[k] for k in STANDARD_FIELDS},
+    }
+
+
+def _calibration_dict(conn, row, with_change=False):
+    d = dict(row)
+    d["old_standard"] = {k: d[f"old_{k}"] for k in STANDARD_FIELDS}
+    d["new_standard"] = {k: d[f"new_{k}"] for k in STANDARD_FIELDS}
+    if with_change:
+        d["standard_change"] = _standard_change(d["old_standard"], d["new_standard"])
+    return d
+
+
+def calibration_for_version(conn, batch_id, version_no):
+    """某版本若为校准版本，返回其校准摘要（含原因与新旧标准）；否则 None。"""
+    get_batch(conn, batch_id)
+    row = conn.execute(
+        """SELECT c.*, a.name AS artifact_name FROM calibrations c
+           JOIN artifacts a ON a.id = c.artifact_id
+           WHERE c.batch_id=? AND c.version_no=?""",
+        (batch_id, version_no),
+    ).fetchone()
+    return _calibration_dict(conn, row, with_change=True) if row else None
+
+
+def get_calibration(conn, batch_id, no, calibration_version=False):
+    """按校准生成的版本号查看校准结果（含新旧标准、原因与重评结果）。
+
+    calibration_version=True 时仅返回校准摘要本身（供 calibrate_artifact 组装）；
+    否则返回完整校准结果：校准信息 + 新版本详情 + 与所见版本的差异。
+    """
+    get_batch(conn, batch_id)
+    row = conn.execute(
+        """SELECT c.*, a.name AS artifact_name FROM calibrations c
+           JOIN artifacts a ON a.id = c.artifact_id
+           WHERE c.batch_id=? AND c.version_no=?""",
+        (batch_id, no),
+    ).fetchone()
+    if not row:
+        raise NotFoundError(
+            f"批次 {batch_id} 的版本 v{no} 不是标准校准版本或不存在")
+    cal = _calibration_dict(conn, row, with_change=True)
+    if calibration_version:
+        return cal
+    result = {"calibration": cal}
+    result.update(version_detail(conn, batch_id, no))
+    result["diff"] = version_diff(conn, batch_id, row["seen_version_no"], no)
+    return result
+
+
+def list_calibrations(conn, batch_id):
+    """批次的标准校准记录（按生成顺序）。"""
+    get_batch(conn, batch_id)
+    rows = conn.execute(
+        """SELECT c.*, a.name AS artifact_name FROM calibrations c
+           JOIN artifacts a ON a.id = c.artifact_id
+           WHERE c.batch_id=? ORDER BY c.id""",
+        (batch_id,),
+    ).fetchall()
+    return [_calibration_dict(conn, r) for r in rows]
 
 
 # ---------------------------------------------------------------- 运输节点交接
@@ -858,7 +1143,12 @@ def get_handover(conn, batch_id, handover_id):
     return _handover_dict(conn, row, with_items=True)
 
 
-def _evaluate_version(conn, version_id, artifacts):
+def _evaluate_version(conn, version_id, standards):
+    """按该版本的监测标准快照重评全部读数，写入风险事件与缺测区间。
+
+    standards: {artifact_id: 该版本使用的标准（含温湿度上下限与采样间隔）}。
+    读数中的节点名称由 readings/nodes 关联补全。
+    """
     rows = conn.execute(
         """SELECT r.*, n.name AS node_name, n.seq AS node_seq
            FROM readings r JOIN nodes n ON n.id = r.node_id
@@ -870,8 +1160,9 @@ def _evaluate_version(conn, version_id, artifacts):
         d = dict(r)
         d["ts"] = parse_ts(d["ts"])
         by_artifact[d["artifact_id"]].append(d)
-    for artifact_id, artifact in artifacts.items():
-        events, gaps = evaluate_artifact(by_artifact.get(artifact_id, []), artifact)
+    for artifact_id, standard in standards.items():
+        events, gaps = evaluate_artifact(
+            by_artifact.get(artifact_id, []), standard)
         for ev in events:
             conn.execute(
                 """INSERT INTO events(version_id, artifact_id, metric, start_ts, end_ts,

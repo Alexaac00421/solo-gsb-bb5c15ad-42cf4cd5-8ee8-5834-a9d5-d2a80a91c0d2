@@ -17,6 +17,7 @@ th{background:#f0f2f5;white-space:nowrap}
 .badge.closed{background:#e6f4ea;color:#1e7e34}
 .badge.gap{background:#fff3cd;color:#8a6d3b}
 .badge.ver{background:#e8eef7;color:#1f3a5f}
+.badge.cal{background:#efe6f7;color:#6b3fa0}
 .summary{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
 .summary .item{background:#fff;border:1px solid #e2e5ea;border-radius:8px;padding:12px 18px;min-width:130px}
 .summary .num{font-size:24px;font-weight:600}
@@ -206,8 +207,51 @@ def _risk_groups_card(groups, title, hint=None):
 </div>"""
 
 
+def calibration_form(batch_id, artifacts, current_version):
+    """标准校准表单；current_version 为空（尚无评估版本）时不可校准。"""
+    if not current_version:
+        return ('<p class="muted">批次尚无评估版本，需先提交读数；'
+                '无评估版本时校准将被拒绝。</p>')
+    art_options = "".join(
+        f'<option value="{a["id"]}" data-tmin="{_fmt_num(a["temp_min"])}" '
+        f'data-tmax="{_fmt_num(a["temp_max"])}" data-hmin="{_fmt_num(a["hum_min"])}" '
+        f'data-hmax="{_fmt_num(a["hum_max"])}" data-interval="{a["sample_interval"]}">'
+        f'{escape(a["name"])}</option>' for a in artifacts)
+    return f"""
+<form method="post" action="/batches/{batch_id}/calibrations">
+  <input type="hidden" name="seen_version" value="{current_version}">
+  <p>选择文物（将以当前 v{current_version} 为所见版本，提交时若已前进会返回冲突）：
+     <select name="artifact_id" id="cal-artifact" onchange="prefillCalibration()">{art_options}</select></p>
+  <p>新温度范围（℃）：
+     <input id="cal-tmin" name="temp_min" size="8" required>
+     <input id="cal-tmax" name="temp_max" size="8" required>
+     新湿度范围（%RH）：
+     <input id="cal-hmin" name="hum_min" size="8" required>
+     <input id="cal-hmax" name="hum_max" size="8" required>
+     新采样间隔（秒）：
+     <input id="cal-interval" name="sample_interval" size="8" required></p>
+  <p>校准原因：<input name="reason" size="60" placeholder="如：登记时温度上限录错，经计量复核应为 22℃" required></p>
+  <button type="submit">用整套新标准重评当前全部读数</button>
+</form>
+<p class="muted">校准原子生成新评估版本：读数不变，按新标准重算风险事件（新版事件全部重新开放）、
+缺测区间与共因风险组；文物当前标准随之更新，后续读数按新标准评估。
+新标准非法或与当前标准相同将被拒绝且不产生版本。</p>
+<script>
+function prefillCalibration(){{
+  var o = document.getElementById('cal-artifact').selectedOptions[0];
+  if(!o) return;
+  document.getElementById('cal-tmin').value = o.dataset.tmin;
+  document.getElementById('cal-tmax').value = o.dataset.tmax;
+  document.getElementById('cal-hmin').value = o.dataset.hmin;
+  document.getElementById('cal-hmax').value = o.dataset.hmax;
+  document.getElementById('cal-interval').value = o.dataset.interval;
+}}
+prefillCalibration();
+</script>"""
+
+
 def batch_detail(batch, nodes, artifacts, summary, events, gaps, risk_groups, versions,
-                 handovers, msg=None, err=None):
+                 handovers, calibrations, msg=None, err=None):
     node_rows = "".join(
         f"<tr><td>{n['seq']}</td><td>{escape(n['name'])}</td><td>{escape(n['location'])}</td></tr>"
         for n in nodes
@@ -221,7 +265,11 @@ def batch_detail(batch, nodes, artifacts, summary, events, gaps, risk_groups, ve
         for a in artifacts
     ) or '<tr><td colspan="5" class="muted">尚未登记文物。</td></tr>'
 
-    art_options = "".join(f'<option value="{a["id"]}">{escape(a["name"])}</option>' for a in artifacts)
+    art_options = "".join(
+        f'<option value="{a["id"]}" data-tmin="{_fmt_num(a["temp_min"])}" '
+        f'data-tmax="{_fmt_num(a["temp_max"])}" data-hmin="{_fmt_num(a["hum_min"])}" '
+        f'data-hmax="{_fmt_num(a["hum_max"])}" data-interval="{a["sample_interval"]}">'
+        f'{escape(a["name"])}</option>' for a in artifacts)
     node_options = "".join(f'<option value="{n["id"]}">#{n["seq"]} {escape(n["name"])}</option>' for n in nodes)
 
     gap_rows = "".join(
@@ -236,11 +284,36 @@ def batch_detail(batch, nodes, artifacts, summary, events, gaps, risk_groups, ve
         if v["version_no"] > 1:
             diff_link = (f' · <a href="/batches/{batch["id"]}/diff?from={v["version_no"] - 1}'
                          f'&to={v["version_no"]}">与上一版对比</a>')
-        ver_rows += f"""<tr><td>v{v['version_no']}</td><td>{_fmt_ts(v['created_at'])}</td>
+        if v["kind"] == "calibration":
+            kind_badge = '<span class="badge cal">标准校准</span>'
+            snapshot_link = (f' · <a href="/batches/{batch["id"]}/calibrations/{v["version_no"]}">'
+                             '校准结果</a>')
+        else:
+            kind_badge = '<span class="badge ver">读数提交</span>'
+            snapshot_link = ""
+        ver_rows += f"""<tr><td>v{v['version_no']}</td><td>{kind_badge}</td>
+<td>{_fmt_ts(v['created_at'])}</td>
 <td>{escape(v['note']) or '<span class="muted">—</span>'}</td>
-<td><a href="/batches/{batch['id']}/versions/{v['version_no']}">查看快照</a>{diff_link}</td></tr>"""
+<td><a href="/batches/{batch['id']}/versions/{v['version_no']}">查看快照</a>{diff_link}{snapshot_link}</td></tr>"""
     if not ver_rows:
-        ver_rows = '<tr><td colspan="4" class="muted">尚无评估版本，提交读数后自动生成。</td></tr>'
+        ver_rows = '<tr><td colspan="5" class="muted">尚无评估版本，提交读数后自动生成。</td></tr>'
+
+    cal_rows = ""
+    for c in calibrations:
+        cal_rows += f"""<tr>
+<td>v{c['seen_version_no']} → <strong>v{c['version_no']}</strong></td>
+<td>{escape(c['artifact_name'])}</td>
+<td>温度 [{_fmt_num(c['old_temp_min'])}, {_fmt_num(c['old_temp_max'])}] →
+    [{_fmt_num(c['new_temp_min'])}, {_fmt_num(c['new_temp_max'])}] ℃<br>
+    湿度 [{_fmt_num(c['old_hum_min'])}, {_fmt_num(c['old_hum_max'])}] →
+    [{_fmt_num(c['new_hum_min'])}, {_fmt_num(c['new_hum_max'])}] %RH<br>
+    采样间隔 {c['old_sample_interval']} → {c['new_sample_interval']} 秒</td>
+<td>{escape(c['reason'])}</td>
+<td>{_fmt_ts(c['created_at'])}</td>
+<td><a href="/batches/{batch['id']}/calibrations/{c['version_no']}">查看校准结果</a></td>
+</tr>"""
+    if not cal_rows:
+        cal_rows = ('<tr><td colspan="6" class="muted">尚无标准校准记录。</td></tr>')
 
     cur_ver = summary["current_version"]
     event_title = f"当前版本（v{cur_ver}）风险事件" if cur_ver else "风险事件（尚无版本）"
@@ -323,6 +396,20 @@ def batch_detail(batch, nodes, artifacts, summary, events, gaps, risk_groups, ve
 </div>
 
 <div class="card">
+  <h2>监测标准校准（录错标准后整套重评，生成新评估版本）</h2>
+  {calibration_form(batch['id'], artifacts, cur_ver)}
+</div>
+
+<div class="card">
+  <h2>标准校准记录（旧版读数、标准与关闭结论仍可查询；旧交接记录保持冻结）</h2>
+  <table>
+    <tr><th>版本变化</th><th>文物</th><th>标准变化（旧 → 新）</th><th>校准原因</th>
+        <th>校准时间</th><th></th></tr>
+    {cal_rows}
+  </table>
+</div>
+
+<div class="card">
   <h2>{event_title}</h2>
   <table>
     <tr><th>文物</th><th>指标</th><th>起止时间</th><th>读数</th><th>实测范围</th>
@@ -363,15 +450,66 @@ def batch_detail(batch, nodes, artifacts, summary, events, gaps, risk_groups, ve
 
 <div class="card">
   <h2>评估版本</h2>
-  <table><tr><th>版本</th><th>生成时间</th><th>备注</th><th>操作</th></tr>{ver_rows}</table>
+  <table><tr><th>版本</th><th>类型</th><th>生成时间</th><th>备注</th><th>操作</th></tr>{ver_rows}</table>
 </div>"""
     return page(f"批次 {batch['name']}", body)
 
 
 # ---------------------------------------------------------------- 版本快照
 
-def version_page(batch, detail):
+def _standards_card(standards, title, hint=None):
+    rows = ""
+    for s in standards:
+        current = "" if s.get("is_current") else ' <span class="badge cal">与当前标准不同</span>'
+        rows += f"""<tr>
+<td>{escape(s['artifact_name'])}（#{s['artifact_id']}）{current}</td>
+<td>[{_fmt_num(s['temp_min'])}, {_fmt_num(s['temp_max'])}] ℃</td>
+<td>[{_fmt_num(s['hum_min'])}, {_fmt_num(s['hum_max'])}] %RH</td>
+<td>{s['sample_interval']} 秒</td>
+</tr>"""
+    if not rows:
+        rows = '<tr><td colspan="4" class="muted">该版本无标准快照。</td></tr>'
+    hint_html = f'<p class="muted">{escape(hint)}</p>' if hint else ""
+    return f"""<div class="card">
+  <h2>{escape(title)}</h2>
+  {hint_html}
+  <table><tr><th>文物</th><th>温度上下限</th><th>湿度上下限</th><th>采样间隔</th></tr>
+  {rows}</table>
+</div>"""
+
+
+def _calibration_block(cal):
+    if not cal:
+        return ""
+    return f"""<div class="card">
+  <h2>标准校准信息</h2>
+  <p>由 <span class="badge ver">v{cal['seen_version_no']}</span>
+     校准生成 <span class="badge cal">v{cal['version_no']}</span>；
+     校准时间：{_fmt_ts(cal['created_at'])}；校准原因：{escape(cal['reason'])}</p>
+  <table>
+    <tr><th>字段</th><th>校准前（旧标准）</th><th>校准后（新标准）</th></tr>
+    <tr><td>温度范围</td>
+        <td>[{_fmt_num(cal['old_temp_min'])}, {_fmt_num(cal['old_temp_max'])}] ℃</td>
+        <td>[{_fmt_num(cal['new_temp_min'])}, {_fmt_num(cal['new_temp_max'])}] ℃</td></tr>
+    <tr><td>湿度范围</td>
+        <td>[{_fmt_num(cal['old_hum_min'])}, {_fmt_num(cal['old_hum_max'])}] %RH</td>
+        <td>[{_fmt_num(cal['new_hum_min'])}, {_fmt_num(cal['new_hum_max'])}] %RH</td></tr>
+    <tr><td>采样间隔</td>
+        <td>{cal['old_sample_interval']} 秒</td>
+        <td>{cal['new_sample_interval']} 秒</td></tr>
+  </table>
+  <p class="muted">该版本以新整套标准重评所见版本全部既有读数生成：读数未改动，
+  风险事件全部重新开放，缺测区间与共因风险组按新标准重算；
+  旧版读数、标准、评估及关闭结论仍可查询。
+  <a href="/batches/{cal['batch_id']}/calibrations/{cal['version_no']}">查看校准结果与版本差异</a></p>
+</div>"""
+
+
+def version_page(batch, detail, msg=None, err=None):
     v = detail["version"]
+    kind_badge = ('<span class="badge cal">标准校准版本</span>'
+                  if v.get("kind") == "calibration"
+                  else '<span class="badge ver">读数提交版本</span>')
     reading_rows = ""
     for r in detail["readings"]:
         mark = ' <span class="badge gap">更正</span>' if r["corrected_from"] else ""
@@ -388,13 +526,16 @@ def version_page(batch, detail):
         for g in detail["gaps"]
     ) or '<tr><td colspan="4" class="muted">无缺测区间。</td></tr>'
 
-    body = f"""
+    body = _banner(msg, err) + f"""
 <p><a href="/batches/{batch['id']}">← 返回批次</a></p>
 <div class="card">
-  <h2>批次「{escape(batch['name'])}」评估版本 v{v['version_no']}</h2>
+  <h2>批次「{escape(batch['name'])}」评估版本 v{v['version_no']}　{kind_badge}</h2>
   <p class="muted">生成时间：{_fmt_ts(v['created_at'])}　备注：{escape(v['note']) or '—'}</p>
   <p class="muted">历史版本为只读快照：读数、事件与关闭结论均保持当时状态。</p>
 </div>
+{_calibration_block(detail.get('calibration'))}
+{_standards_card(detail.get('standards', []), f"版本 v{v['version_no']} 监测标准快照",
+                 "该版本全部读数即按此标准评估；校准后文物当前标准更新，旧版标准随快照保留。")}
 <div class="card">
   <h2>风险事件（含关闭结论）</h2>
   <table>
@@ -404,7 +545,7 @@ def version_page(batch, detail):
   </table>
 </div>
 {_risk_groups_card(detail.get('risk_groups', []), f"跨文物共因风险组（v{v['version_no']} 快照）",
-                   "按该版本事件快照计算，补录/更正读数生成新版后重算；旧版分组保持可查，关闭事件只更新组内状态计数，不改变成员。")}
+                   "按该版本事件快照计算，补录/更正读数或标准校准生成新版后重算；旧版分组保持可查，关闭事件只更新组内状态计数，不改变成员。")}
 <div class="card">
   <h2>缺测区间</h2>
   <table><tr><th>文物</th><th>区间</th><th>约定采样间隔</th><th>实际间隔</th></tr>{gap_rows}</table>
@@ -576,3 +717,80 @@ def handover_record_page(batch, record):
   {_handover_items_table(record['items'])}
 </div>"""
     return page(f"交接记录 #{record['id']}", body)
+
+
+# ---------------------------------------------------------------- 标准校准结果
+
+def calibration_page(batch, result):
+    cal = result["calibration"]
+    v = result["version"]
+    diff = result.get("diff", {"readings": {"added": [], "removed": [], "corrected": []},
+                               "events": {"added": [], "removed": [], "changed": [],
+                                          "closure_not_inherited": []}})
+    rd, ed = diff["readings"], diff["events"]
+
+    def ev_names(items):
+        return "<br>".join(_event_line(e) for e in items) or '<span class="muted">无</span>'
+
+    body = f"""
+<p><a href="/batches/{batch['id']}">← 返回批次</a>
+   · <a href="/batches/{batch['id']}/versions/{cal['seen_version_no']}">所见版本 v{cal['seen_version_no']}</a>
+   · <a href="/batches/{batch['id']}/versions/{cal['version_no']}">新版本 v{cal['version_no']} 快照</a>
+   · <a href="/batches/{batch['id']}/diff?from={cal['seen_version_no']}&to={cal['version_no']}">版本差异</a></p>
+<div class="card">
+  <h2>标准校准结果：v{cal['seen_version_no']} → v{cal['version_no']}
+      <span class="badge cal">标准校准</span></h2>
+  <p>文物：<strong>{escape(cal['artifact_name'])}</strong>（#{cal['artifact_id']}）；
+     校准时间：{_fmt_ts(cal['created_at'])}；校准原因：{escape(cal['reason'])}</p>
+  <table>
+    <tr><th>字段</th><th>校准前（所见版本标准）</th><th>校准后（新整套标准）</th></tr>
+    <tr><td>温度范围</td>
+        <td>[{_fmt_num(cal['old_temp_min'])}, {_fmt_num(cal['old_temp_max'])}] ℃</td>
+        <td>[{_fmt_num(cal['new_temp_min'])}, {_fmt_num(cal['new_temp_max'])}] ℃</td></tr>
+    <tr><td>湿度范围</td>
+        <td>[{_fmt_num(cal['old_hum_min'])}, {_fmt_num(cal['old_hum_max'])}] %RH</td>
+        <td>[{_fmt_num(cal['new_hum_min'])}, {_fmt_num(cal['new_hum_max'])}] %RH</td></tr>
+    <tr><td>采样间隔</td>
+        <td>{cal['old_sample_interval']} 秒</td>
+        <td>{cal['new_sample_interval']} 秒</td></tr>
+  </table>
+  <p class="muted">以新整套标准重评所见版本的全部既有读数，读数本身不变；
+  新版本风险事件全部重新开放，缺测区间与共因风险组随之更新。
+  旧版读数、标准、评估及关闭结论仍可查询；旧交接确认记录保持冻结，
+  当前版交接预览改按新标准核验；后续读数提交与离线采集包合并均使用最新标准。</p>
+</div>
+<div class="card">
+  <h2>校准后版本 v{cal['version_no']} 的监测标准</h2>
+  <table><tr><th>文物</th><th>温度上下限</th><th>湿度上下限</th><th>采样间隔</th></tr>"""
+    for s in result.get("standards", []):
+        mark = "" if s.get("is_current") else ' <span class="badge cal">与当前标准不同</span>'
+        body += f"""
+    <tr><td>{escape(s['artifact_name'])}（#{s['artifact_id']}）{mark}</td>
+        <td>[{_fmt_num(s['temp_min'])}, {_fmt_num(s['temp_max'])}] ℃</td>
+        <td>[{_fmt_num(s['hum_min'])}, {_fmt_num(s['hum_max'])}] %RH</td>
+        <td>{s['sample_interval']} 秒</td></tr>"""
+    body += f"""
+  </table>
+</div>
+<div class="card">
+  <h2>事件重评结果（读数不变，标准变化导致的增 / 减 / 重新开放）</h2>
+  <h3>新增风险事件（{len(ed['added'])}）</h3>
+  <table><tr><td>{ev_names(ed['added'])}</td></tr></table>
+  <h3>消失风险事件（{len(ed['removed'])}）</h3>
+  <table><tr><td>{ev_names(ed['removed'])}</td></tr></table>
+  <h3>重新开放（旧版已关闭、新版未继承关闭状态，{len(ed['closure_not_inherited'])}）</h3>
+  <table><tr><td>{ev_names(ed['closure_not_inherited'])}</td></tr></table>
+  <p class="muted">读数集合完全相同（新增 {len(rd['added'])}、移除 {len(rd['removed'])}、
+  更正 {len(rd['corrected'])} 条）；当前版本开放事件
+  {sum(1 for e in result['events'] if e['status'] == 'open')} 个、缺测区间
+  {len(result['gaps'])} 个，共因风险组 {len(result['risk_groups'])} 组。</p>
+</div>
+<div class="card">
+  <h2>校准后风险事件</h2>
+  <table>
+    <tr><th>文物</th><th>指标</th><th>起止时间</th><th>读数</th><th>实测范围</th>
+        <th>限值</th><th>最大偏离</th><th>涉及节点</th><th>状态</th></tr>
+    {_event_rows(result['events'], batch['id'], closable=False)}
+  </table>
+</div>"""
+    return page("标准校准结果", body)
