@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 端到端演示：创建批次 → 节点 → 文物 → 读数（跨节点越界 + 缺测）→ 关闭事件 →
-# 更正读数生成新版本 → 查看版本差异 → 查询跨文物共因风险组。
+# 更正读数生成新版本 → 查看版本差异 → 查询跨文物共因风险组 →
+# 离线采集包（幂等/冲突）→ 运输节点交接（预览/确认冻结）→ 监测标准校准。
 # 用法：BASE=http://localhost:8000 ./scripts/demo.sh
 set -euo pipefail
 BASE="${BASE:-http://localhost:8000}"
@@ -150,3 +151,23 @@ echo
 echo "== 20. 交接记录列表与详情（确认后冻结，补录/更正/关闭事件均不改写）=="
 curl -s "$BASE/api/batches/1/handovers"
 curl -s "$BASE/api/batches/1/handovers/1" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("记录 #%d 冻结于 v%d: %s｜说明: %s｜证据: %s" % (d["id"], d["version"], d["result_label"], d["note"], d["evidence_no"]))'
+
+echo "== 21. 监测标准校准：文物 1 限值录错（18~24 → 16~28，间隔 600 → 1800），按当前 v4 重评 =="
+CUR=$(curl -s "$BASE/api/batches/1/versions" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["version_no"])')
+echo "当前评估版本: v$CUR"
+curl -s -X POST "$BASE/api/batches/1/calibrations" -H "$JSON" -d "{
+  \"artifact_id\": 1, \"seen_version\": $CUR,
+  \"temp_min\": 16, \"temp_max\": 28, \"hum_min\": 40, \"hum_max\": 65,
+  \"sample_interval\": 1800, \"reason\": \"登记时把运输标准误录成库房标准\"}" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("校准完成: v%d（基于 v%d），读数 %d 条整套复制，新版开放事件 %d，缺测区间 %d" % (d["version"], d["calibration"]["base_version"], d["accepted"], len(d["events"]), len(d["gaps"])))'
+
+echo "== 22. 所见版本过期（seen_version 落后）→ 409，要求重取；新旧标准与校准记录查询 =="
+curl -s -X POST "$BASE/api/batches/1/calibrations" -H "$JSON" -d "{
+  \"artifact_id\": 1, \"seen_version\": $CUR,
+  \"temp_min\": 10, \"temp_max\": 35, \"hum_min\": 30, \"hum_max\": 80,
+  \"sample_interval\": 1800, \"reason\": \"用旧版本号重复提交\"}"
+echo
+echo "-- 当前版本标准（新标准）--"
+curl -s "$BASE/api/batches/1/standards" | python3 -c 'import json,sys; d=json.load(sys.stdin); s=d["standards"][0]; print("v%d: 温度 %g~%g℃, 湿度 %g~%g%%RH, 间隔 %d 秒（%s）" % (d["version"], s["temp_min"], s["temp_max"], s["hum_min"], s["hum_max"], s["sample_interval"], s["artifact_name"]))'
+echo "-- 校准记录列表 --"
+curl -s "$BASE/api/batches/1/calibrations" | python3 -c 'import json,sys; [print("#%d 文物%s: v%d→v%d, %s" % (c["id"], c["artifact_name"], c["base_version"], c["version"], c["reason"])) for c in json.load(sys.stdin)]'

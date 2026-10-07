@@ -58,6 +58,8 @@ def batch_page(ctx):
         batch, service.list_nodes(ctx.conn, bid), service.list_artifacts(ctx.conn, bid),
         summary, events, gaps, risk_groups, service.list_versions(ctx.conn, bid),
         service.list_handovers(ctx.conn, bid),
+        service.list_calibrations(ctx.conn, bid),
+        (cur["version_no"] if cur else None),
         ctx.query.get("msg"), ctx.query.get("err")))
 
 
@@ -167,6 +169,24 @@ def handover_record_page(ctx):
     batch = service.get_batch(ctx.conn, bid)
     record = service.get_handover(ctx.conn, bid, hid)
     return Response(pages.handover_record_page(batch, record))
+
+
+@router.route("POST", "/batches/<bid>/calibrations")
+def calibrate_page(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    try:
+        result = service.calibrate_standard(
+            ctx.conn, bid, ctx.body.get("artifact_id"), ctx.body.get("seen_version"),
+            ctx.body.get("temp_min"), ctx.body.get("temp_max"),
+            ctx.body.get("hum_min"), ctx.body.get("hum_max"),
+            ctx.body.get("sample_interval"), ctx.body.get("reason"))
+    except (service.ValidationError, service.NotFoundError, service.ConflictError) as e:
+        details = ""
+        if getattr(e, "details", None):
+            details = "：" + "；".join(str(d) for d in e.details)
+        return redirect(f"/batches/{bid}?err=" + quote(e.message + details))
+    return redirect(f"/batches/{bid}?msg=" + quote(
+        f"监测标准已校准，按新标准重评生成评估版本 v{result['version']}"))
 
 
 # ================================================================ API
@@ -353,6 +373,39 @@ def api_handover_detail(ctx):
     bid = _int(ctx.params["bid"], "批次 id")
     hid = _int(ctx.params["hid"], "交接记录 id")
     return json_response(service.get_handover(ctx.conn, bid, hid))
+
+
+@router.route("POST", "/api/batches/<bid>/calibrations")
+def api_calibrate(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    result = service.calibrate_standard(
+        ctx.conn, bid, body.get("artifact_id"), body.get("seen_version"),
+        body.get("temp_min"), body.get("temp_max"),
+        body.get("hum_min"), body.get("hum_max"),
+        body.get("sample_interval"), body.get("reason"))
+    return json_response(result, 201)
+
+
+@router.route("GET", "/api/batches/<bid>/calibrations")
+def api_list_calibrations(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    return json_response(service.list_calibrations(ctx.conn, bid))
+
+
+@router.route("GET", "/api/batches/<bid>/calibrations/<cid>")
+def api_calibration_detail(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    cid = _int(ctx.params["cid"], "校准记录 id")
+    return json_response(service.get_calibration(ctx.conn, bid, cid))
+
+
+@router.route("GET", "/api/batches/<bid>/standards")
+def api_version_standards(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    vno = ctx.query.get("version")
+    version_no = _int(vno, "版本号") if vno else None
+    return json_response(service.version_standards(ctx.conn, bid, version_no))
 
 
 # ================================================================ 服务器

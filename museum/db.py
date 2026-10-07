@@ -106,11 +106,38 @@ CREATE TABLE IF NOT EXISTS handovers (
     created_at TEXT NOT NULL
 );
 
+-- 每个评估版本生效的监测标准快照（校准只更换标准、不改读数）。
+-- 校准前生成的旧版本在该表无记录，查询时回退到文物当前标准（见 init_db 回填）。
+CREATE TABLE IF NOT EXISTS version_standards (
+    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+    artifact_id INTEGER NOT NULL REFERENCES artifacts(id),
+    temp_min REAL NOT NULL,
+    temp_max REAL NOT NULL,
+    hum_min REAL NOT NULL,
+    hum_max REAL NOT NULL,
+    sample_interval INTEGER NOT NULL,
+    PRIMARY KEY (version_id, artifact_id)
+);
+
+-- 监测标准校准：工作人员发现限值录错后，以整套新标准重评所见版本全部既有读数，
+-- 原子生成新版本（base_version_no → version_no），旧版读数/标准/评估/关闭结论保留。
+CREATE TABLE IF NOT EXISTS calibrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    artifact_id INTEGER NOT NULL REFERENCES artifacts(id),
+    base_version_no INTEGER NOT NULL,
+    version_no INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_readings_version ON readings(version_id, artifact_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_version ON events(version_id, status);
 CREATE INDEX IF NOT EXISTS idx_gaps_version ON gaps(version_id);
 CREATE INDEX IF NOT EXISTS idx_packages_batch ON packages(batch_id);
 CREATE INDEX IF NOT EXISTS idx_handovers_batch ON handovers(batch_id);
+CREATE INDEX IF NOT EXISTS idx_version_standards_version ON version_standards(version_id);
+CREATE INDEX IF NOT EXISTS idx_calibrations_batch ON calibrations(batch_id);
 """
 
 
@@ -122,10 +149,34 @@ def connect(path):
     return conn
 
 
+def _backfill_version_standards(conn):
+    """旧库升级：为缺少标准快照的既有版本补拍文物当前标准。
+
+    校准功能上线前的版本都按文物登记表中的标准评估，此处回填为显式快照；
+    之后每次生成新版本都会写入当次生效的标准，不再需要补拍。
+    """
+    missing = conn.execute(
+        """SELECT v.id FROM versions v
+           WHERE NOT EXISTS (
+               SELECT 1 FROM version_standards vs WHERE vs.version_id = v.id)"""
+    ).fetchall()
+    for row in missing:
+        conn.execute(
+            """INSERT INTO version_standards(version_id, artifact_id, temp_min,
+               temp_max, hum_min, hum_max, sample_interval)
+               SELECT ?, a.id, a.temp_min, a.temp_max, a.hum_min, a.hum_max,
+                      a.sample_interval
+               FROM artifacts a
+               WHERE a.batch_id = (SELECT batch_id FROM versions WHERE id = ?)""",
+            (row["id"], row["id"]),
+        )
+
+
 def init_db(path):
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _backfill_version_standards(conn)
         conn.commit()
     finally:
         conn.close()
